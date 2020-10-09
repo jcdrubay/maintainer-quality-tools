@@ -1,14 +1,19 @@
 #!/usr/bin/env python
-
-from __future__ import print_function
+# -*- coding: utf-8 -*-
 
 import re
 import os
 import shutil
 import subprocess
 import sys
-from getaddons import get_addons, get_modules, is_installable_module
+from six import string_types
+from getaddons import (
+    get_addons, get_modules, get_modules_info, get_dependencies)
 from travis_helpers import success_msg, fail_msg
+try:
+    import ConfigParser
+except ImportError:
+    import configparser as ConfigParser
 
 
 def has_test_errors(fname, dbname, odoo_version, check_loaded=True):
@@ -42,7 +47,7 @@ def has_test_errors(fname, dbname, odoo_version, check_loaded=True):
 
     def make_pattern_list_callable(pattern_list):
         for i in range(len(pattern_list)):
-            if isinstance(pattern_list[i], basestring):
+            if isinstance(pattern_list[i], string_types):
                 regex = re.compile(pattern_list[i])
                 pattern_list[i] = lambda x, regex=regex:\
                     regex.search(x['message'])
@@ -60,7 +65,7 @@ def has_test_errors(fname, dbname, odoo_version, check_loaded=True):
     color_regex = re.compile(r'\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]')
     log_start_regex = re.compile(
         r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \d+ (?P<loglevel>\w+) '
-        '(?P<db>(%s)|([?])) (?P<logger>\S+): (?P<message>.*)$' % dbname)
+        '(?P<db>(%s)|([?])) (?P<logger>\S+): (?P<message>.*\S)\s*$' % dbname)
     log_records = []
     last_log_record = dict.fromkeys(log_start_regex.groupindex.keys())
     with open(fname) as log:
@@ -82,15 +87,15 @@ def has_test_errors(fname, dbname, odoo_version, check_loaded=True):
                 ignore = True
                 break
         if ignore:
-            break
+            continue
         for report_pattern in errors_report:
             if report_pattern(log_record):
                 errors.append(log_record)
                 break
 
     if check_loaded:
-        if not [r for r in log_records if 'Modules loaded.' == r['message']]:
-            errors.append({'message': "Modules loaded message not found."})
+        if not [r for r in log_records if 'Modules loaded.' in r['message']]:
+            errors.append({'message': "Message not found: 'Modules loaded.'"})
 
     if errors:
         for e in errors:
@@ -109,12 +114,13 @@ def str2bool(string):
 
 def get_server_path(odoo_full, odoo_version, travis_home):
     """
-    Calculate server path
+    Computes server path
     :param odoo_full: Odoo repository path
     :param odoo_version: Odoo version
     :param travis_home: Travis home directory
     :return: Server path
     """
+    odoo_version = odoo_version.replace('/', '-')
     odoo_org, odoo_repo = odoo_full.split('/')
     server_dirname = "%s-%s" % (odoo_repo, odoo_version)
     server_path = os.path.join(travis_home, server_dirname)
@@ -123,21 +129,23 @@ def get_server_path(odoo_full, odoo_version, travis_home):
 
 def get_addons_path(travis_dependencies_dir, travis_build_dir, server_path):
     """
-    Calculate addons path
+    Computes addons path
     :param travis_dependencies_dir: Travis dependencies directory
     :param travis_build_dir: Travis build directory
     :param server_path: Server path
     :return: Addons path
     """
-    addons_path_list = get_addons(travis_dependencies_dir)
-    addons_path_list.insert(0, travis_build_dir)
-    addons_path_list.append(server_path + "/addons")
+    addons_path_list = get_addons(travis_build_dir)
+    addons_path_list.extend(get_addons(travis_dependencies_dir))
+    addons_path_list.append(os.path.join(server_path, "addons"))
     addons_path = ','.join(addons_path_list)
     return addons_path
 
 
-def get_server_script(odoo_version):
-    return 'odoo-bin' if float(odoo_version) >= 10 else 'openerp-server'
+def get_server_script(server_path):
+    if os.path.isfile(os.path.join(server_path, 'odoo-bin')):
+        return 'odoo-bin'
+    return 'openerp-server'
 
 
 def get_addons_to_check(travis_build_dir, odoo_include, odoo_exclude):
@@ -171,16 +179,34 @@ def get_test_dependencies(addons_path, addons_list):
     if not addons_list:
         return ['base']
     else:
+        modules = {}
         for path in addons_path.split(','):
-            manif_path = is_installable_module(
-                os.path.join(path, addons_list[0]))
-            if not manif_path:
-                continue
-            manif = eval(open(manif_path).read())
-            return list(
-                set(manif.get('depends', [])) |
-                set(get_test_dependencies(addons_path, addons_list[1:])) -
-                set(addons_list))
+            modules.update(get_modules_info(path))
+        dependencies = set()
+        for module in addons_list:
+            dependencies |= get_dependencies(modules, module)
+        return list(dependencies - set(addons_list))
+
+
+def cmd_strip_secret(cmd):
+    cmd_secret = []
+    skip_next = False
+    for param in cmd:
+        if skip_next:
+            skip_next = False
+            continue
+        if param.startswith('--db_'):
+            cmd_secret.append(param.split('=')[0] + '=***')
+            continue
+        if param.startswith('--log-db'):
+            cmd_secret.append('--log-db=***')
+            continue
+        if param in ['-w', '-r']:
+            cmd_secret.extend([param, '***'])
+            skip_next = True
+            continue
+        cmd_secret.append(param)
+    return cmd_secret
 
 
 def setup_server(db, odoo_unittest, tested_addons, server_path, script_name,
@@ -188,14 +214,16 @@ def setup_server(db, odoo_unittest, tested_addons, server_path, script_name,
                  unbuffer=True, server_options=None):
     """
     Setup the base module before running the tests
-    if the database template exists then will be used.
+    if the database template exists, then it will be used.
     :param db: Template database name
     :param odoo_unittest: Boolean for unit test (travis parameter)
-    :param tested_addons: List of modules that need to be installed
+    :param tested_addons: (list) Modules that need to be installed
     :param server_path: Server path
-    :param travis_build_dir: path to the modules to be tested
+    :param script_name: name of the main server file
     :param addons_path: Addons path
     :param install_options: Install options (travis parameter)
+    :param preinstall_modules: (list) Modules that should be preinstalled
+    :param unbuffer: keeps output colors
     :param server_options: (list) Add these flags to the Odoo server init
     """
     if preinstall_modules is None:
@@ -208,7 +236,6 @@ def setup_server(db, odoo_unittest, tested_addons, server_path, script_name,
     except subprocess.CalledProcessError:
         print("Using previous openerp_template database.")
     else:
-        # unbuffer keeps output colors
         cmd_odoo = ["unbuffer"] if unbuffer else []
         cmd_odoo += ["%s/%s" % (server_path, script_name),
                      "-d", db,
@@ -216,20 +243,23 @@ def setup_server(db, odoo_unittest, tested_addons, server_path, script_name,
                      "--stop-after-init",
                      "--init", ','.join(preinstall_modules),
                      ] + install_options + server_options
-        print(" ".join(cmd_odoo))
-        subprocess.check_call(cmd_odoo)
+        print(" ".join(cmd_strip_secret(cmd_odoo)))
+        try:
+            subprocess.check_call(cmd_odoo)
+        except subprocess.CalledProcessError as e:
+            return e.returncode
     return 0
 
 
 def run_from_env_var(env_name_startswith, environ):
-    '''Method to run a script defined from a environment variable
+    """Method to run a script defined from an environment variable
     :param env_name_startswith: String with name of first letter of
                                 environment variable to find.
     :param environ: Dictionary with full environ to search
-    '''
+    """
     commands = [
         command
-        for environ_variable, command in sorted(environ.iteritems())
+        for environ_variable, command in sorted(environ.items())
         if environ_variable.startswith(env_name_startswith)
     ]
     for command in commands:
@@ -238,20 +268,21 @@ def run_from_env_var(env_name_startswith, environ):
 
 
 def create_server_conf(data, version):
-    '''Create (or edit) default configuration file of odoo
-    :params data: Dict with all info to save in file'''
+    """Create (or edit) default configuration file of odoo
+    :params data: Dict with all info to save in file"""
     fname_conf = os.path.expanduser('~/.openerp_serverrc')
     if not os.path.exists(fname_conf):
+        # If not exists the file then is created
         fconf = open(fname_conf, "w")
-        fconf.write('[options]\n')
-    else:
-        # file is there, created by .travis.yml, assume the section is
-        # present and only append our stuff
-        fconf = open(fname_conf, "a")
-        fconf.write('\n')
-    for key, value in data.iteritems():
-        fconf.write(key + ' = ' + os.path.expanduser(value) + '\n')
-    fconf.close()
+        fconf.close()
+    config = ConfigParser.ConfigParser()
+    config.read(fname_conf)
+    if not config.has_section('options'):
+        config.add_section('options')
+    for key, value in data.items():
+        config.set('options', key, value)
+    with open(fname_conf, 'w') as configfile:
+        config.write(configfile)
 
 
 def copy_attachments(dbtemplate, dbdest, data_dir):
@@ -278,10 +309,13 @@ def main(argv=None):
     server_options = os.environ.get('SERVER_OPTIONS', "").split()
     expected_errors = int(os.environ.get("SERVER_EXPECTED_ERRORS", "0"))
     odoo_version = os.environ.get("VERSION")
+    odoo_branch = os.environ.get("ODOO_BRANCH")
     instance_alive = str2bool(os.environ.get('INSTANCE_ALIVE'))
     unbuffer = str2bool(os.environ.get('UNBUFFER', True))
-    data_dir = os.environ.get("DATA_DIR", '~/data_dir')
+    data_dir = os.path.expanduser(os.environ.get("DATA_DIR", '~/data_dir'))
     test_enable = str2bool(os.environ.get('TEST_ENABLE', True))
+    dbtemplate = os.environ.get('MQT_TEMPLATE_DB', 'openerp_template')
+    database = os.environ.get('MQT_TEST_DB', 'openerp_test')
     if not odoo_version:
         # For backward compatibility, take version from parameter
         # if it's not globally set
@@ -301,13 +335,15 @@ def main(argv=None):
             test_loglevel = 'info'
             test_loghandler = 'openerp.tools.yaml_import:DEBUG'
     odoo_full = os.environ.get("ODOO_REPO", "odoo/odoo")
-    server_path = get_server_path(odoo_full, odoo_version, travis_home)
-    script_name = get_server_script(odoo_version)
+    server_path = get_server_path(odoo_full, odoo_branch or odoo_version,
+                                  travis_home)
+    script_name = get_server_script(server_path)
     addons_path = get_addons_path(travis_dependencies_dir,
                                   travis_build_dir,
                                   server_path)
     create_server_conf({
-        'addons_path': addons_path,
+        # when installing with pip we don't need an addons_path
+        'addons_path': addons_path if os.environ.get("MQT_DEP", "OCA") == "OCA" else "",
         'data_dir': data_dir,
     }, odoo_version)
     tested_addons_list = get_addons_to_check(travis_build_dir,
@@ -322,24 +358,23 @@ def main(argv=None):
         print("WARNING!\nNothing to test- exiting early.")
         return 0
     else:
-        print("Modules to test: %s" % tested_addons)
-    # setup the base module without running the tests
-    dbtemplate = "openerp_template"
+        print("Modules to test: %s" % tested_addons_list)
+    # setup the preinstall modules without running the tests
     preinstall_modules = get_test_dependencies(addons_path,
                                                tested_addons_list)
+
     preinstall_modules = list(set(preinstall_modules) - set(get_modules(
-        os.environ.get('TRAVIS_BUILD_DIR'))))
+        os.environ.get('TRAVIS_BUILD_DIR')))) or ['base']
     print("Modules to preinstall: %s" % preinstall_modules)
-    setup_server(dbtemplate, odoo_unittest, tested_addons, server_path,
+    setup_server(dbtemplate, odoo_unittest, tested_addons_list, server_path,
                  script_name, addons_path, install_options, preinstall_modules,
                  unbuffer, server_options)
 
     # Running tests
-    database = "openerp_test"
-
     cmd_odoo_test = ["coverage", "run",
                      "%s/%s" % (server_path, script_name),
                      "-d", database,
+                     "--db-filter=^%s$" % database,
                      "--stop-after-init",
                      "--log-level", test_loglevel,
                      ]
@@ -355,7 +390,7 @@ def main(argv=None):
             "-d", database,
             "--stop-after-init",
             "--log-level=warn",
-        ] + install_options + ["--init", None] + server_options
+        ] + server_options + install_options + ["--init", None]
         commands = ((cmd_odoo_install, False),
                     (cmd_odoo_test, True),
                     )
@@ -366,8 +401,10 @@ def main(argv=None):
     all_errors = []
     counted_errors = 0
     for to_test in to_test_list:
-        print("\nTesting %s:" % to_test)
-        db_odoo_created = False
+        if odoo_unittest:
+            print("\nTesting %s:" % [to_test])
+        else:
+            print("\nTesting %s:" % tested_addons_list)
         try:
             db_odoo_created = subprocess.call(
                 ["createdb", "-T", dbtemplate, database])
@@ -386,19 +423,21 @@ def main(argv=None):
                 command_call = [item
                                 for item in commands[0][0]
                                 if item not in rm_items] + \
-                    ['--db-filter=^%s$' % database]
+                    ['--pidfile=/tmp/odoo.pid']
             else:
                 command[-1] = to_test
                 # Run test command; unbuffer keeps output colors
                 command_call = (["unbuffer"] if unbuffer else []) + command
-            print(' '.join(command_call))
+            print(" ".join(cmd_strip_secret(command_call)))
             pipe = subprocess.Popen(command_call,
                                     stderr=subprocess.STDOUT,
                                     stdout=subprocess.PIPE)
-            with open('stdout.log', 'w') as stdout:
-                for line in iter(pipe.stdout.readline, ''):
+            with open('stdout.log', 'wb') as stdout:
+                for line in iter(pipe.stdout.readline, b''):
                     stdout.write(line)
-                    print(line.strip())
+                    print(line.strip().decode(
+                        'UTF-8', errors='backslashreplace'
+                    ))
             returncode = pipe.wait()
             # Find errors, except from failed mails
             errors = has_test_errors(
@@ -406,16 +445,16 @@ def main(argv=None):
             if returncode != 0:
                 all_errors.append(to_test)
                 print(fail_msg, "Command exited with code %s" % returncode)
-                # If not exists errors then
-                # add an error when returcode!=0
-                # because is really a error.
+                # If there are no errors,
+                # adds an error when returcode!=0
+                # because it's actually an error.
                 if not errors:
                     errors += 1
             if errors:
                 counted_errors += errors
                 all_errors.append(to_test)
                 print(fail_msg, "Found %d lines with errors" % errors)
-        if not instance_alive:
+        if not instance_alive and odoo_unittest:
             # Don't drop the database if will be used later.
             subprocess.call(["dropdb", database])
 
@@ -431,6 +470,29 @@ def main(argv=None):
         return 1
     elif counted_errors != expected_errors:
         return 1
+    # no test error, let's generate .pot and msgmerge all .po files
+    must_run_makepot = (
+        os.environ.get('MAKEPOT') == '1'
+        and os.environ.get('TRAVIS_REPO_SLUG', '').startswith('OCA/')
+        and (
+            os.environ.get('TRAVIS_BRANCH')
+            in ('8.0', '9.0', '10.0', '11.0', '12.0', '13.0')
+            or "ocabot-merge" in os.environ.get('TRAVIS_BRANCH', '')
+        )
+        and os.environ.get('TRAVIS_PULL_REQUEST') == 'false'
+        and os.environ.get('GITHUB_USER')
+        and os.environ.get('GITHUB_EMAIL')
+        and os.environ.get('GITHUB_TOKEN')
+    )
+    if must_run_makepot:
+        # run makepot using the database we just tested
+        makepot_cmd = ['unbuffer'] if unbuffer else []
+        makepot_cmd += [
+            'travis_makepot',
+            database,
+        ]
+        if subprocess.call(makepot_cmd) != 0:
+            return 1
     # if we get here, all is OK
     return 0
 
